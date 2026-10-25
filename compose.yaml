@@ -1,0 +1,31 @@
+services:
+  ghidrama:
+    build: .
+    ports:
+      - "127.0.0.1:8000:8000"
+    environment:
+      GHIDRA_INSTALL_DIR: /opt/ghidra
+      JAVA_HOME: /opt/java/openjdk
+      GHIDRAMA_DATA_DIR: /var/lib/ghidrama
+      GHIDRAMA_FRONTEND_DIR: /app/frontend/dist
+      GHIDRAMA_MAX_UPLOAD_MB: "50"
+    volumes:
+      - "${GHIDRA_INSTALL_DIR:?Set GHIDRA_INSTALL_DIR in .env to an extracted Ghidra installation}:/opt/ghidra:ro"
+      - ghidrama-data:/var/lib/ghidrama
+    init: true
+    restart: unless-stopped
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    mem_limit: 6g
+    pids_limit: 512
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/api/health', timeout=5)"]
+      interval: 30s
+      timeout: 6s
+      start_period: 40s
+      retries: 3
+
+volumes:
+  ghidrama-data:
