@@ -119,7 +119,9 @@ class ProviderClient:
         self.thinking: str | bool | None = None
 
     async def request(self, method: str, path: str, body: dict | None = None, *, timeout: int = 90) -> dict:
-        headers = {"Authorization": f"Bearer {self.api_key}", "Content-Type": "application/json"}
+        headers = {"Content-Type": "application/json"}
+        if self.api_key:
+            headers["Authorization"] = f"Bearer {self.api_key}"
         if self.provider == "openrouter":
             headers["X-Title"] = "Ghidrama"
         try:
@@ -129,6 +131,10 @@ class ProviderClient:
                 raise ProviderError("The provider rejected the API key or access to this model.")
             if response.status_code == 429:
                 raise ProviderError("Provider rate or account limit reached. Wait and try again.")
+            if self.provider == "ollama" and response.status_code == 404:
+                raise ProviderError("Ollama Cloud could not find the selected model. Fetch models in Model connections and select an exact catalog ID; local Ollama :cloud and -cloud aliases may not work with the cloud API.")
+            if response.status_code >= 500:
+                raise ProviderError(f"The model provider is temporarily unavailable (HTTP {response.status_code}). Try again shortly.")
             if response.status_code >= 400:
                 raise ProviderError(f"Provider request failed (HTTP {response.status_code}). Check the model ID, account balance, and model tool support.")
             if len(response.content) > 4 * 1024 * 1024:
@@ -137,7 +143,9 @@ class ProviderClient:
             if not isinstance(result, dict) or result.get("error"):
                 raise ProviderError("Provider returned an invalid response.")
             return result
-        except (httpx.TimeoutException, httpx.NetworkError):
+        except httpx.TimeoutException:
+            raise ProviderError("The model provider did not respond in time. Try again shortly.") from None
+        except httpx.NetworkError:
             raise ProviderError("Could not reach the model provider. Check the connection and try again.") from None
         except (ValueError, httpx.HTTPError):
             raise ProviderError("Provider returned an unreadable response.") from None
@@ -145,8 +153,12 @@ class ProviderClient:
     async def models(self) -> list[dict]:
         payload = await self.request("GET", "/api/tags" if self.provider == "ollama" else "/models")
         entries = payload.get("models" if self.provider == "ollama" else "data", [])
+        if not isinstance(entries, list):
+            raise ProviderError("Provider returned an invalid model catalog.")
         result = []
         for entry in entries[:10000]:
+            if not isinstance(entry, dict):
+                continue
             model_id = entry.get("model") or entry.get("id") or entry.get("name")
             if isinstance(model_id, str):
                 result.append({"id": model_id, "name": entry.get("name", model_id)})
@@ -158,7 +170,9 @@ class ProviderClient:
             return "API key verified. Model tool support is checked when an investigation runs."
         if not self.model:
             raise ProviderError("Choose an Ollama cloud model before testing the connection.")
-        await self.request("POST", "/api/chat", {"model": self.model, "messages": [{"role": "user", "content": "Reply OK."}], "stream": False, "options": {"num_predict": 4}})
+        response = await self.request("POST", "/api/chat", {"model": self.model, "messages": [{"role": "user", "content": "Reply OK."}], "stream": False, "options": {"num_predict": 4}})
+        if not isinstance(response.get("message"), dict) or not isinstance(response["message"].get("content"), str):
+            raise ProviderError("Ollama Cloud did not return a usable test response.")
         return "Connected. The selected Ollama model answered a short test request."
 
     async def chat(self, messages: list[dict], tools: list[dict], *, max_output_tokens: int = 4096) -> dict:
@@ -270,6 +284,9 @@ async def test_provider(provider: str):
 @router.get("/{provider}/models")
 async def list_models(provider: str):
     try:
-        return await configured_client(provider).models()
+        # Ollama's hosted catalog is public. Discover models before asking the
+        # analyst to save credentials, and do not send a key to this endpoint.
+        client = ProviderClient("ollama", "", "") if provider == "ollama" else configured_client(provider)
+        return await client.models()
     except ProviderError as exc:
         raise HTTPException(502, str(exc)) from None

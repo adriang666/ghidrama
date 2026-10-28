@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { useState } from "react";
 import {
   Check,
   ChevronRight,
@@ -21,37 +21,52 @@ export default function SettingsDialog({
   onChanged: () => void;
 }) {
   const [selected, setSelected] = useState<"ollama" | "openrouter">("ollama");
-  const provider = providers.find((item) => item.id === selected);
+  const [savedProviders, setSavedProviders] = useState<
+    Partial<Record<Provider["id"], Provider>>
+  >({});
+  const provider =
+    savedProviders[selected] || providers.find((item) => item.id === selected);
   const [apiKey, setApiKey] = useState("");
-  const [model, setModel] = useState(provider?.model || "");
+  const [modelDraft, setModelDraft] = useState<string>();
+  const model = modelDraft ?? provider?.model ?? "";
   const [models, setModels] = useState<{ id: string; name: string }[]>([]);
   const [busy, setBusy] = useState("");
   const [error, setError] = useState("");
   const [success, setSuccess] = useState("");
+  const hasEdits =
+    !!apiKey.trim() || model.trim() !== (provider?.model || "");
 
-  useEffect(() => {
+  const selectProvider = (id: Provider["id"]) => {
+    if (id === selected) return;
+    setSelected(id);
     setApiKey("");
-    setModel(provider?.model || "");
+    setModelDraft(undefined);
     setModels([]);
     setError("");
     setSuccess("");
-  }, [selected, provider?.model]);
+  };
+
+  const saveCurrentSettings = async () => {
+    const saved = await request<Provider>(`/api/providers/${selected}`, {
+      method: "PUT",
+      body: JSON.stringify({
+        model: model.trim(),
+        ...(apiKey.trim() ? { api_key: apiKey.trim() } : {}),
+      }),
+    });
+    setSavedProviders((current) => ({ ...current, [selected]: saved }));
+    setApiKey("");
+    setModelDraft(undefined);
+    onChanged();
+  };
 
   const save = async () => {
     setBusy("save");
     setError("");
     setSuccess("");
     try {
-      await request(`/api/providers/${selected}`, {
-        method: "PUT",
-        body: JSON.stringify({
-          model: model.trim(),
-          ...(apiKey.trim() ? { api_key: apiKey.trim() } : {}),
-        }),
-      });
-      setApiKey("");
+      await saveCurrentSettings();
       setSuccess("Provider settings saved.");
-      onChanged();
     } catch (err) {
       setError(errorMessage(err));
     } finally {
@@ -63,6 +78,7 @@ export default function SettingsDialog({
     setError("");
     setSuccess("");
     try {
+      if (hasEdits || !provider?.configured) await saveCurrentSettings();
       const result = await request<{ ok: boolean; message: string }>(
         `/api/providers/${selected}/test`,
         { method: "POST" },
@@ -78,6 +94,7 @@ export default function SettingsDialog({
   const fetchModels = async () => {
     setBusy("models");
     setError("");
+    setSuccess("");
     try {
       const items = await request<{ id: string; name: string }[]>(
         `/api/providers/${selected}/models`,
@@ -95,12 +112,13 @@ export default function SettingsDialog({
     setError("");
     setSuccess("");
     try {
-      await request(`/api/providers/${selected}`, {
+      const saved = await request<Provider>(`/api/providers/${selected}`, {
         method: "PUT",
         body: JSON.stringify({ api_key: "", model: provider?.model || "" }),
       });
+      setSavedProviders((current) => ({ ...current, [selected]: saved }));
       setApiKey("");
-      setModels([]);
+      if (selected !== "ollama") setModels([]);
       setSuccess("Saved API key removed from this server.");
       onChanged();
     } catch (err) {
@@ -122,12 +140,12 @@ export default function SettingsDialog({
           <button
             key={id}
             className={selected === id ? "selected" : ""}
-            onClick={() => setSelected(id)}
+            onClick={() => selectProvider(id)}
             disabled={!!busy}
           >
             {providerName(id)}
             <span
-              className={`connection-dot ${providers.find((p) => p.id === id)?.configured ? "connected" : ""}`}
+              className={`connection-dot ${(savedProviders[id] || providers.find((p) => p.id === id))?.configured ? "connected" : ""}`}
             />
           </button>
         ))}
@@ -176,6 +194,7 @@ export default function SettingsDialog({
           spellCheck={false}
           value={apiKey}
           onChange={(event) => setApiKey(event.target.value)}
+          disabled={!!busy}
           placeholder={
             provider?.configured
               ? "Leave blank to keep your saved key"
@@ -197,7 +216,7 @@ export default function SettingsDialog({
           </label>
           <button
             className="text-button"
-            disabled={!!busy || !provider?.configured}
+            disabled={!!busy || (selected !== "ollama" && !provider?.configured)}
             onClick={fetchModels}
           >
             {busy === "models" ? "Loading…" : "Fetch models"}
@@ -206,9 +225,9 @@ export default function SettingsDialog({
         </div>
         <input
           id="provider-model"
-          list="available-models"
           value={model}
-          onChange={(event) => setModel(event.target.value)}
+          onChange={(event) => setModelDraft(event.target.value)}
+          disabled={!!busy}
           placeholder={
             selected === "ollama"
               ? "Model name from your Ollama catalog"
@@ -217,18 +236,35 @@ export default function SettingsDialog({
           autoComplete="off"
           spellCheck={false}
         />
-        <datalist id="available-models">
-          {models.map((item) => (
-            <option value={item.id} key={item.id}>
-              {item.name}
-            </option>
-          ))}
-        </datalist>
+        {models.length > 0 && (
+          <>
+            <div className="field-heading">
+              <label className="field-label" htmlFor="available-models">
+                Available models ({models.length})
+              </label>
+            </div>
+            <select
+              id="available-models"
+              value={models.some((item) => item.id === model) ? model : ""}
+              onChange={(event) => setModelDraft(event.target.value)}
+              disabled={!!busy}
+              style={{ width: "100%" }}
+            >
+              <option value="" disabled>
+                Select a model
+              </option>
+              {models.map((item) => (
+                <option value={item.id} key={item.id}>
+                  {item.name === item.id ? item.id : `${item.name} (${item.id})`}
+                </option>
+              ))}
+            </select>
+          </>
+        )}
         <p className="field-help">
-          Save a key first, then fetch the current model catalog. Select a model
-          that supports tool calling.
-          {selected === "ollama" &&
-            " Testing Ollama sends a small model request and uses your provider quota."}
+          {selected === "ollama"
+            ? "Fetch the public catalog and select a model that supports tool calling. API model names can differ from Ollama CLI aliases. Testing sends a small model request and uses your provider quota."
+            : "Save a key first, then fetch the current model catalog. Select a model that supports tool calling."}
         </p>
         <div className="privacy-note">
           <ShieldCheck size={19} />
@@ -251,13 +287,13 @@ export default function SettingsDialog({
           className="button secondary"
           disabled={
             !!busy ||
-            !provider?.configured ||
-            (selected === "ollama" && !provider.model)
+            (!apiKey.trim() && !provider?.configured) ||
+            (selected === "ollama" && !model.trim())
           }
           onClick={test}
         >
-          {busy === "test" && <LoaderCircle size={15} className="spin" />}Test
-          saved connection
+          {busy === "test" && <LoaderCircle size={15} className="spin" />}
+          {hasEdits ? "Save & test" : "Test connection"}
         </button>
         <button
           className="button primary"

@@ -51,6 +51,15 @@ cd ..
 
 Open **http://127.0.0.1:8000**. The backend serves the built interface from the same origin. Keep one API process: do not run multiple Uvicorn workers against this local queue.
 
+The foreground command stops when its terminal session ends. On Linux or WSL with a running systemd user session, you can instead start a background service from the repository root:
+
+```bash
+systemd-run --user --unit=ghidrama --property=Restart=on-failure --property=RestartSec=3 --working-directory="$PWD" "$PWD/scripts/start.sh"
+systemctl --user status ghidrama
+```
+
+Use `systemctl --user restart ghidrama` after rebuilding or changing backend code, and `systemctl --user stop ghidrama` to stop it. This transient service lasts for the current systemd user session; run the start command again after a reboot. Do not run the foreground command at the same time. If a previously loaded page reports that it cannot reach Ghidrama, check this service before changing provider credentials.
+
 If your OS Python lacks venv support, install its `python3-venv` package or use a complete Python distribution. This workspace may already contain an installed `.venv` and a built `frontend/dist`; in that case, run `./scripts/start.sh` directly.
 
 For UI development, start the backend as above, then run `pnpm dev` inside `frontend`. Vite listens on loopback and proxies `/api` to port 8000.
@@ -65,7 +74,7 @@ Follow progress, cancel, inspect each answer and evidence, or download the resul
 
 1. Upload an EXE or DLL. Its analysis status changes from queued to analyzing and then ready, partial, or failed. A partial result is explicitly labelled.
 2. Select a function to retrieve its decompilation and references. Large functions can take longer on the first request; later requests use the revision-specific cache.
-3. Open provider settings. Choose Ollama Cloud or OpenRouter, enter the API key, select a tool-capable model, and save. The key is not returned by any read endpoint or saved in browser storage. The Ollama connection test sends a very short model request, which may consume account usage.
+3. Open provider settings. Choose Ollama Cloud or OpenRouter, enter the API key, select a tool-capable model, and save. Ollama's public model catalog can be fetched before saving a key; use an exact catalog ID, since local `:cloud` and `-cloud` aliases may differ. Fetching this catalog does not verify your credentials. The key is not returned by any read endpoint or saved in browser storage. The Ollama connection test sends a very short model request, which may consume account usage.
 4. Ask a question, optionally scoped to the selected function. Starting an investigation sends your question and selected analysis evidence to the chosen cloud provider. Original binary files are not uploaded to the provider.
 5. Follow evidence markers to inspect the supporting Ghidra data. A citation proves where evidence came from; it is not a guarantee that the model interpreted it correctly.
 6. Propose a name or comment, review it, and apply. Changes require the expected analysis revision and update the underlying Ghidra project. To undo, propose the old value recorded in the audit history.

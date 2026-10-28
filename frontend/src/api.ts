@@ -5,7 +5,17 @@ export async function request<T>(
   const headers = new Headers(options.headers);
   if (options.body && !(options.body instanceof FormData))
     headers.set("Content-Type", "application/json");
-  const response = await fetch(path, { ...options, headers });
+  let response: Response;
+  try {
+    response = await fetch(path, { ...options, headers });
+  } catch (error) {
+    if (error instanceof TypeError) {
+      throw new Error(
+        "Cannot reach the Ghidrama server. Make sure it is running, then reload this page and try again.",
+      );
+    }
+    throw error;
+  }
   if (!response.ok) {
     let message = `Request failed (${response.status})`;
     try {
