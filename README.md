@@ -10,11 +10,13 @@ This release is for a single analyst on a trusted local machine. It performs **s
 - Real Ghidra projects through PyGhidra in separate worker processes. Per-project file locks serialize access across the API and MCP processes.
 - Functions, lazy decompilation, instructions, strings, imports, exports, sections, and direct caller/callee relationships.
 - A React workbench with function search, code navigation, a call graph, investigation history, evidence links, and Markdown report download.
+- A Pseudocode workspace with cancellable extraction of all indexed functions, a revision-labelled `.c` export, and cloud-assisted function rewrites or program sketches.
+- An **Analyze & rewrite** workflow: prepare the binary with UPX/Ghidra, discover up to five main routines with the configured cloud model, and generate separate readable rewrites with full captured source evidence and a ZIP export.
 - Direct Ollama Cloud and OpenRouter integration, model discovery, connection testing, encrypted saved credentials, and provider-independent tool calls.
 - A LangGraph investigation workflow using the official MCP client to call a real sample-scoped MCP stdio server. Tool schemas, argument validation, bounded output, run limits, and cancellation are enforced by application code.
 - Reviewed function renames and comments, applied to the actual Ghidra project, with an audit record and revision checks.
 
-The local release uses SQLite and filesystem artifacts, and a bounded local process queue. PostgreSQL, Redis/Celery, shared-user identity, external MCP access, Windows debugging, managed .NET decompilation, PDB upload workflows, advanced type editing, and automated unpacking are future extensions. Containers improve packaging; they do not turn this release into a hostile multi-tenant malware service.
+The local release uses SQLite and filesystem artifacts, and a bounded local process queue. PostgreSQL, Redis/Celery, shared-user identity, external MCP access, Windows debugging, managed .NET decompilation, PDB upload workflows, advanced type editing, and unpackers beyond UPX are future extensions. Containers improve packaging; they do not turn this release into a hostile multi-tenant malware service.
 
 ## Prerequisites
 
@@ -55,6 +57,12 @@ For UI development, start the backend as above, then run `pnpm dev` inside `fron
 
 ## Use the workbench
 
+For the automated path, upload an executable, open **Analyze & rewrite**, and click **Unpack, analyze & rewrite**. Choose a configured provider and up to 1, 3, or 5 main functions. The workflow can wait for an in-progress analysis; it re-prepares older analyses without preprocessing provenance. It never executes the specimen. Starting the workflow authorizes sending decompiled evidence to the selected provider and can consume cloud usage.
+
+Main-function discovery has an 80,000-token investigation budget. Each selected function is then supplied in full to a separate rewrite request (maximum 180,000 source characters and 12,288 output tokens). The shared 500,000-token admission budget uses conservative estimates plus reported usage; it is not an exact billing cap. There are no automatic retries of failed rewrites. Ollama models advertising `low` thinking use that setting for this workflow, without changing saved provider settings. Other models keep their defaults.
+
+Follow progress, cancel, inspect each answer and evidence, or download the results ZIP. Completed work survives cancellation, failure, and application restart. A restart does not automatically resume cloud spending. Running again starts a new cloud workflow and reuses revision-specific local decompilation caches. Selection is bounded, and inferred names and control flow require review: a successful workflow does not verify semantic equivalence or reconstruct the entire program.
+
 1. Upload an EXE or DLL. Its analysis status changes from queued to analyzing and then ready, partial, or failed. A partial result is explicitly labelled.
 2. Select a function to retrieve its decompilation and references. Large functions can take longer on the first request; later requests use the revision-specific cache.
 3. Open provider settings. Choose Ollama Cloud or OpenRouter, enter the API key, select a tool-capable model, and save. The key is not returned by any read endpoint or saved in browser storage. The Ollama connection test sends a very short model request, which may consume account usage.
@@ -63,6 +71,43 @@ For UI development, start the backend as above, then run `pnpm dev` inside `fron
 6. Propose a name or comment, review it, and apply. Changes require the expected analysis revision and update the underlying Ghidra project. To undo, propose the old value recorded in the audit history.
 
 Ollama Cloud currently does not provide enforced structured outputs. Ghidrama validates arguments and tool results itself. OpenRouter requests require support for requested parameters and ask for providers with data collection disabled. Routing controls do not make cloud processing local. Use only specimens whose content you are permitted to send to the selected service.
+
+## UPX unpacking
+
+Uploads and analysis retries automatically check native x86/x64 PEs for standard UPX section names or a UPX pack header. When detected, Ghidrama runs the locally installed UPX tool with `-d` into a separate file before importing it into Ghidra. The uploaded executable is never launched. The original remains unchanged; the overview and reports show the original and analyzed SHA-256 hashes, sizes, and UPX version. Ghidra imports, raw-memory evidence, pseudocode, and cloud investigation tools all use the unpacked input for that revision. An older analysis with UPX sections offers **Unpack and reanalyze**.
+
+Install the official [UPX release](https://github.com/upx/upx/releases) for your host and set `GHIDRAMA_UPX_PATH` to its executable, or put `upx` on `PATH`, then restart Ghidrama. The local installation in this workspace uses UPX 5.2.1. `scripts/doctor.py` and `/api/health` report availability. For Docker, mount a compatible UPX executable read-only inside the container and set the container's `GHIDRAMA_UPX_PATH` to that path; UPX is not bundled in the base image.
+
+Unpacking has a 30-second timeout, a 256 MB output-file limit, and a 1 GB process address-space limit. Cancellation terminates the unpacker and removes incomplete output. Missing UPX, invalid output, or decompression failure stops analysis with an actionable error; it does not silently analyze the packed loader. Modified UPX stubs, removed signatures, other packers, and nested packing may need manual unpacking. Detection is a heuristic, not proof that an executable is unpacked. Unpacked bytes and Ghidra projects are kept by content hash, and earlier analysis revisions and evidence remain intact.
+
+## Pseudocode and cloud rewrites
+
+After uploading an EXE or DLL and waiting for analysis, open **Pseudocode**:
+
+1. Select a function to view Ghidra's C-like pseudocode immediately. This uses local Ghidra and needs no model key.
+2. Choose **Extract all functions** to decompile the indexed program in the background. Progress shows recovered, unavailable, and truncated functions. **Cancel extraction** stops the job while retaining completed batches. **Download pseudocode (.c)** exports the captured revision with addresses, coverage, and failure notices. It is reconstructed pseudocode, not the original source or a guaranteed compilable C program.
+3. Choose **Rewrite selected function** for clearer names and structure, **Create program sketch** for an outline of the program's main logic, or **Analyze selected pseudocode** for an explanation. These buttons prepare a request in the Investigator.
+4. Choose Ollama Cloud or OpenRouter, check the model and function context, then send the request. Rewrites retrieve real decompiler evidence through MCP, retain the original Ghidra output, and cite captured source evidence. Review the model's interpretation and uncertain names/types against that evidence. Completed answers and exact evidence can be downloaded from the Investigator and revisited in its history.
+
+Local extraction covers functions in Ghidra's index; undiscovered or packed code may be absent. A job is limited to 15 minutes plus completion of its current bounded batch and 20 million exported pseudocode characters. Run extraction again to reuse completed function caches. Analysis changes require a new extraction; existing downloads identify their captured revision.
+
+For large routines, the model can page through decompiled C with `decompile_function` character offsets (up to 24,000 characters per page). Pseudocode runs allow up to 12,288 generated tokens per response and 180 seconds per provider call; these remain inside the selected cumulative run budget, with the larger response reserved before further exploration. Ordinary investigations retain the 4,096-token response allowance.
+
+A cloud **program sketch** covers the routines the model inspects within the existing investigation limits, rather than rewriting every function in a large executable. The interface reports how many functions supplied decompiler evidence. Truncated source is flagged, and responses cut off by a provider's output limit are reported as failures. Cloud requests only start when sent from the Investigator. Model results remain interpretations, not proof of semantic equivalence or recovered original source.
+
+## Investigation budgets
+
+The Investigator's **Run budget** selector controls cumulative input and output usage across all model calls. Each call sends the conversation again, so this total can be much larger than the model's context window. The default is **Extended**.
+
+| Budget | Cumulative tokens | Model turns | Tool calls | Time |
+| --- | ---: | ---: | ---: | ---: |
+| Standard | 80,000 | 12 | 32 | 4 minutes |
+| Extended (default) | 250,000 | 24 | 64 | 10 minutes |
+| Deep | 500,000 | 40 | 100 | 15 minutes |
+
+Larger budgets may use more provider credits. These are application limits, not changes to the provider's context window or account quota. Usage is reported by the provider; estimates reserve room for a final answer and one citation correction. Tokenization and provider accounting vary, so the cumulative token target is not an exact billing cap.
+
+As a run approaches a limit, Ghidrama stops offering tools and requests a final, cited answer from the captured evidence. Such results are labelled **partial**, can be downloaded, and remain in history. If there is not enough room for another model call, the result is explicitly labelled as an evidence index, with no claim that a model answer was produced. Time and context-size stops also retain captured evidence. Select **Use question again** to prepare a new question under the selected budget; check the current function context and provider before sending. Existing failed runs are preserved and never automatically retried.
 
 ## Configuration
 
@@ -76,6 +121,9 @@ Ollama Cloud currently does not provide enforced structured outputs. Ghidrama va
 | `GHIDRAMA_ANALYSIS_TIMEOUT` | Worker timeout in seconds; default 600 |
 | `GHIDRAMA_WORKER_MEMORY_MB` | Java heap budget per analysis worker; default 2048 |
 | `GHIDRAMA_MAX_WORKERS` | Concurrent analysis jobs; default 2 |
+| `GHIDRAMA_UPX_PATH` | Optional absolute UPX executable path; otherwise searches PATH |
+| `GHIDRAMA_MAX_UNPACKED_MB` | Maximum unpacked PE file size; default 256 MB |
+| `GHIDRAMA_UNPACK_TIMEOUT` | UPX wall-clock and CPU limit in seconds; default 30 |
 | `GHIDRAMA_PORT` | Local launcher port; default 8000 |
 
 The loopback host restrictions and same-origin checks are intentional. There is no user login in this local release. Do not expose it to a LAN or the Internet, or place it behind a public reverse proxy. A shared deployment needs authentication, project-level authorization, separate worker hosts, and OS-enforced isolation before exposure.

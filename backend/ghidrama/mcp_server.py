@@ -58,7 +58,7 @@ def build_server(sample_id: str, revision: int | None = None) -> FastMCP:
         """Get PE metadata, engine version, entry point and analysis warnings for the scoped sample."""
         item = analysis()
         sample = store.get_sample(sample_id)
-        return envelope({"program": {key: item.get(key) for key in ("image_base", "entry_point", "architecture", "format", "engine", "warnings", "sections")},
+        return envelope({"program": {key: item.get(key) for key in ("image_base", "entry_point", "architecture", "format", "engine", "warnings", "sections", "preprocessing")},
                          "sha256": sample["sha256"], "name": sample["name"], "function_count": len(item.get("functions", [])), "status": sample["status"]})
 
     @server.tool()
@@ -70,12 +70,19 @@ def build_server(sample_id: str, revision: int | None = None) -> FastMCP:
         return envelope(page(entries, offset, limit))
 
     @server.tool()
-    async def decompile_function(address: str) -> dict:
-        """Retrieve a function's Ghidra decompilation, signature and references. Decompiled C is an approximation."""
+    async def decompile_function(address: str, offset: int = 0, limit: int = 24000) -> dict:
+        """Read Ghidra C in character pages (limit 1–24000). Follow next_offset to read the rest of a large function. Offsets refer to the same revision's full C text; inferred C is an approximation."""
+        if offset < 0 or not 1 <= limit <= 24000:
+            raise ValueError("offset must be nonnegative and limit must be 1–24000 characters")
         function = await detail(address)
         code = function.get("decompiled")
-        return envelope({"address": function["address"], "name": function["name"], "signature": function.get("signature"), "decompiled": code[:24000] if code is not None else None,
-                         "decompile_error": function.get("decompile_error"), "truncated": bool(function.get("decompiled_truncated")) or len(code or "") > 24000,
+        if offset > len(code or ""):
+            raise ValueError("offset is beyond the available decompilation")
+        end = min(offset + limit, len(code or ""))
+        return envelope({"address": function["address"], "name": function["name"], "signature": function.get("signature"), "decompiled": code[offset:end] if code is not None else None,
+                         "offset": offset, "total_characters": len(code or ""), "next_offset": end if end < len(code or "") else None,
+                         "source_truncated": bool(function.get("decompiled_truncated")),
+                         "decompile_error": function.get("decompile_error"), "truncated": bool(function.get("decompiled_truncated")) or offset > 0 or end < len(code or ""),
                          "references_truncated": len(function.get("callers", [])) > 60 or len(function.get("callees", [])) > 60,
                          "comment": function.get("comment"), "callers": function.get("callers", [])[:60], "callees": function.get("callees", [])[:60]})
 
@@ -136,7 +143,9 @@ def build_server(sample_id: str, revision: int | None = None) -> FastMCP:
         rva = int(address, 16) - image_base
         if rva < 0:
             raise ValueError("Address is before the image base")
-        with pefile.PE(str(store.sample_dir(sample_id) / "original.bin"), fast_load=True) as pe:
+        from .unpacking import input_path
+        source = input_path(store.sample_dir(sample_id), item.get("preprocessing"))
+        with pefile.PE(str(source), fast_load=True) as pe:
             valid = rva + size <= pe.OPTIONAL_HEADER.SizeOfHeaders
             for section in pe.sections:
                 start = section.VirtualAddress

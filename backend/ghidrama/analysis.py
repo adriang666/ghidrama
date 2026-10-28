@@ -122,29 +122,37 @@ def worker_slot(store: Store, timeout: float = 120, cancel_check=None):
             time.sleep(0.1)
 
 
-def run_worker(store: Store, sample_id: str, action: str, *, address: str | None = None, annotation: dict | None = None, on_process=None, cancel_check=None) -> dict:
+def run_worker(store: Store, sample_id: str, action: str, *, address: str | None = None, addresses: list[str] | None = None, annotation: dict | None = None, preprocessing: dict | None = None, on_process=None, cancel_check=None) -> dict:
     with worker_slot(store, cancel_check=cancel_check):
         if cancel_check and cancel_check():
             raise InterruptedError("Operation was cancelled.")
-        return _run_worker_process(store, sample_id, action, address=address, annotation=annotation, on_process=on_process, cancel_check=cancel_check)
+        return _run_worker_process(store, sample_id, action, address=address, addresses=addresses, annotation=annotation, preprocessing=preprocessing, on_process=on_process, cancel_check=cancel_check)
 
 
-def _run_worker_process(store: Store, sample_id: str, action: str, *, address: str | None = None, annotation: dict | None = None, on_process=None, cancel_check=None) -> dict:
+def _run_worker_process(store: Store, sample_id: str, action: str, *, address: str | None = None, addresses: list[str] | None = None, annotation: dict | None = None, preprocessing: dict | None = None, on_process=None, cancel_check=None) -> dict:
     if not settings.ghidra_available:
         raise ValueError("Ghidra is not configured. Set GHIDRA_INSTALL_DIR and JAVA_HOME, then restart the server.")
     folder = store.sample_dir(sample_id)
     if any(part.startswith(".") for part in folder.parts):
         raise ValueError("Ghidra project paths cannot contain hidden folders. Set GHIDRAMA_DATA_DIR to an absolute path without dot-prefixed directory names, then restart.")
+    from .unpacking import input_path
+    if preprocessing is None:
+        preprocessing = (store.get_analysis(sample_id) or {}).get("preprocessing")
+    source = input_path(folder, preprocessing)
     output = folder / f"result-{uuid.uuid4().hex}.json"
-    args = [sys.executable, "-m", "ghidrama.ghidra_worker", "--sample-dir", str(folder), "--action", action, "--output", str(output), "--timeout", str(settings.analysis_timeout)]
+    args = [sys.executable, "-m", "ghidrama.ghidra_worker", "--sample-dir", str(folder), "--input-name", source.name, "--action", action, "--output", str(output), "--timeout", str(settings.analysis_timeout)]
     if address:
         args += ["--address", normalize_address(address)]
+    if addresses:
+        if len(addresses) > 4:
+            raise ValueError("A decompilation batch may contain at most four functions.")
+        args += ["--addresses", *[normalize_address(item) for item in addresses]]
     proposal = None
     if annotation:
         proposal = folder / f"proposal-{uuid.uuid4().hex}.json"
         proposal.write_text(json.dumps(annotation))
         args += ["--proposal", str(proposal)]
-    timeout = settings.analysis_timeout + 60 if action == "analyze" else 120
+    timeout = settings.analysis_timeout + 60 if action == "analyze" else 180 if action == "functions" else 120
     log_path = folder / "worker.log"
     try:
         with log_path.open("wb") as log:
@@ -167,6 +175,8 @@ def _run_worker_process(store: Store, sample_id: str, action: str, *, address: s
         result = json.loads(output.read_text())
         if result.get("error"):
             raise ValueError(result["error"])
+        if action in {"analyze", "annotate"} and preprocessing:
+            result["preprocessing"] = preprocessing
         return result
     finally:
         output.unlink(missing_ok=True)
@@ -195,6 +205,32 @@ def get_function_detail(sample_id: str, address: str, cancel_check=None) -> dict
         function["analysis_revision"] = sample["analysis_revision"]
         store.save_function(sample_id, sample["analysis_revision"], function)
         return function
+
+
+def get_function_batch(sample_id: str, addresses: list[str], revision: int, cancel_check=None) -> list[dict]:
+    """Reuse revision caches and one JVM for up to four missing functions."""
+    if not 1 <= len(addresses) <= 4:
+        raise ValueError("A decompilation batch must contain one to four functions.")
+    store = Store()
+    with project_lock(store, sample_id, timeout=200, cancel_check=cancel_check):
+        sample = store.get_sample(sample_id)
+        if not sample or sample["status"] not in {"ready", "partial"} or sample["analysis_revision"] != revision:
+            raise ValueError("Analysis changed during pseudocode extraction. Generate again against the current analysis.")
+        functions = [store.get_function(sample_id, address) for address in addresses]
+        if any(function is None for function in functions):
+            raise ValueError("A requested function is no longer in the analysis.")
+        missing = [function["address"] for function in functions if not function.get("detail_loaded")]
+        if missing:
+            result = run_worker(store, sample_id, "functions", addresses=missing, cancel_check=cancel_check)
+            for function in result["functions"]:
+                function["analysis_revision"] = revision
+                store.save_function(sample_id, revision, function)
+            functions = [store.get_function(sample_id, address) for address in addresses]
+        for function in functions:
+            # Index artifacts may themselves contain details (for example, older
+            # imports). The exporter always reads a separate revision cache.
+            store.save_function(sample_id, revision, function)
+        return functions
 
 
 def apply_annotation(sample_id: str, annotation_id: str) -> dict:
@@ -238,7 +274,11 @@ class AnalysisManager:
                 return
             store.update_sample(sample_id, status="analyzing", error=None)
             sample = store.get_sample(sample_id)
-            analysis = run_worker(store, sample_id, "analyze", on_process=lambda p: self.processes.__setitem__(sample_id, p), cancel_check=lambda: sample_id in self.cancelled)
+            from .unpacking import prepare_input
+            preprocessing = prepare_input(store.sample_dir(sample_id), sample["sha256"],
+                                          on_process=lambda p: self.processes.__setitem__(sample_id, p),
+                                          cancel_check=lambda: sample_id in self.cancelled)
+            analysis = run_worker(store, sample_id, "analyze", preprocessing=preprocessing, on_process=lambda p: self.processes.__setitem__(sample_id, p), cancel_check=lambda: sample_id in self.cancelled)
             if sample_id in self.cancelled:
                 return
             analysis.update(sample_id=sample_id, revision=sample["analysis_revision"] + 1)

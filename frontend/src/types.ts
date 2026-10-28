@@ -19,6 +19,8 @@ export type FunctionSummary = {
 export type FunctionDetail = FunctionSummary & {
   signature: string;
   decompiled: string | null;
+  decompile_error?: string;
+  decompiled_truncated?: boolean;
   disassembly: {
     address: string;
     bytes: string;
@@ -48,6 +50,14 @@ export type Analysis = {
     permissions: string;
   }[];
   warnings: string[];
+  preprocessing?: {
+    status: "unpacked" | "not_detected";
+    original_sha256: string;
+    original_size: number;
+    analyzed_sha256: string;
+    analyzed_size: number;
+    tool_version?: string;
+  };
 };
 export type Provider = {
   id: "ollama" | "openrouter";
@@ -68,7 +78,15 @@ export type Run = {
   question: string;
   provider: string;
   model: string;
-  status: "queued" | "running" | "complete" | "failed" | "cancelled";
+  mode?: "investigation" | "pseudocode";
+  analysis_revision?: number;
+  function_address?: string | null;
+  pseudocode_coverage?: { scope: "function" | "program_sketch"; addresses: string[]; total_functions: number; truncated: boolean };
+  budget?: "standard" | "extended" | "deep";
+  limits?: { total_tokens: number; model_turns: number; tool_calls: number; seconds: number };
+  limit_reason?: string;
+  answer_kind?: "model" | "evidence_index";
+  status: "queued" | "running" | "complete" | "partial" | "failed" | "cancelled";
   answer?: string | null;
   error?: string | null;
   events: {
@@ -100,9 +118,50 @@ export type Health = {
 };
 export type MainTab =
   | "overview"
+  | "workflow"
+  | "pseudocode"
   | "decompiler"
   | "disassembly"
   | "strings"
   | "imports"
   | "graph"
   | "annotations";
+
+export type WorkflowJob = {
+  id: string;
+  sample_id: string;
+  status: string;
+  stage: string;
+  provider: string;
+  model: string;
+  analysis_revision: number;
+  error?: string | null;
+  token_limit: number;
+  budget_used: number;
+  tokens_reported: number;
+  discovery_id?: string | null;
+  functions: { address: string; name: string; reason: string; status: string; run_id?: string | null; error?: string }[];
+  run_ids: string[];
+};
+
+export type RequestedPrompt = {
+  text: string;
+  nonce: number;
+  sampleId: string;
+  mode: "investigation" | "pseudocode";
+  scope: "function" | "program";
+};
+export type Ask = (text: string, mode?: "investigation" | "pseudocode", scope?: "function" | "program") => void;
+export type PseudocodeJob = {
+  sample_id: string;
+  analysis_revision: number;
+  status: "queued" | "running" | "complete" | "partial" | "failed" | "cancelled" | "interrupted";
+  total: number;
+  processed: number;
+  recovered: number;
+  failed: number;
+  truncated: number;
+  source_partial: boolean;
+  error?: string | null;
+  functions: { address: string; name: string; available: boolean; truncated: boolean; error?: string | null }[];
+};

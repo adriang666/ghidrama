@@ -31,6 +31,8 @@ import type {
   Health,
   MainTab,
   Provider,
+  Ask,
+  RequestedPrompt,
   Sample,
 } from "./types";
 import AgentPanel from "./AgentPanel";
@@ -70,10 +72,7 @@ export default function App() {
   const [annotationError, setAnnotationError] = useState("");
   const [annotationBusy, setAnnotationBusy] = useState(false);
   const [refreshRevision, setRefreshRevision] = useState(0);
-  const [requestedPrompt, setRequestedPrompt] = useState<{
-    text: string;
-    nonce: number;
-  } | null>(null);
+  const [requestedPrompt, setRequestedPrompt] = useState<RequestedPrompt | null>(null);
   const [toast, setToast] = useState("");
   const fileInput = useRef<HTMLInputElement>(null);
   const searchInput = useRef<HTMLInputElement>(null);
@@ -202,7 +201,12 @@ export default function App() {
     refreshRevision,
   ]);
   useEffect(() => {
-    if (!selectedId || !functionAddress) {
+    // Reanalysis can replace a packed loader with a different function index.
+    // Wait for that revision's index before fetching the selected address.
+    if (!selectedId || !functionAddress ||
+        !["ready", "partial"].includes(selected?.status || "") ||
+        analysis?.sample_id !== selectedId ||
+        analysis?.revision !== selected?.analysis_revision) {
       setFunc(null);
       setFunctionLoading(false);
       return;
@@ -228,7 +232,10 @@ export default function App() {
   }, [
     selectedId,
     functionAddress,
+    selected?.status,
     selected?.analysis_revision,
+    analysis?.sample_id,
+    analysis?.revision,
     refreshRevision,
   ]);
 
@@ -269,6 +276,7 @@ export default function App() {
   };
   const analysisAction = async (action: "analyze" | "cancel") => {
     if (!selected) return;
+    setError("");
     try {
       await request(`/api/samples/${selected.id}/${action}`, {
         method: "POST",
@@ -350,9 +358,10 @@ export default function App() {
       setApplying("");
     }
   };
-  const ask = (text: string) => {
+  const ask: Ask = (text, mode = "investigation", scope = "function") => {
+    if (!selectedId) return;
     setAgentOpen(true);
-    setRequestedPrompt({ text, nonce: Date.now() });
+    setRequestedPrompt({ text, mode, scope, sampleId: selectedId, nonce: Date.now() });
   };
 
   return (
@@ -575,7 +584,7 @@ export default function App() {
                     className={`function-item ${functionAddress === item.address ? "selected" : ""}`}
                     onClick={() => {
                       setFunctionAddress(item.address);
-                      setTab("decompiler");
+                      if (tab !== "pseudocode") setTab("decompiler");
                     }}
                     title={item.signature || item.name}
                   >
@@ -652,6 +661,8 @@ export default function App() {
             </div>
           </div>
           <WorkSurface
+            providers={providers}
+            onSettings={() => setSettingsOpen(true)}
             sample={selected}
             analysis={analysis}
             func={func}
@@ -674,6 +685,7 @@ export default function App() {
             onApply={(annotation) => void applyAnnotation(annotation)}
             applying={applying}
             onAsk={ask}
+            onSelectFunction={setFunctionAddress}
           />
         </main>
         {agentOpen && (

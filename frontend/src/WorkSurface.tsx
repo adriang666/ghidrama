@@ -25,16 +25,22 @@ import {
 import { sizeLabel } from "./api";
 import type {
   Analysis,
+  Ask,
   Annotation,
   FunctionDetail,
   MainTab,
+  Provider,
   Sample,
 } from "./types";
 import { CodeView, Empty, Notice, Spinner, Status } from "./ui";
+import PseudocodePanel from "./PseudocodePanel";
+import WorkflowPanel from "./WorkflowPanel";
 
 const tabs: { id: MainTab; title: string; icon: typeof Code2 }[] = [
   { id: "overview", title: "Overview", icon: Layers3 },
+  { id: "workflow", title: "Analyze & rewrite", icon: WandSparkles },
   { id: "decompiler", title: "Decompiler", icon: Code2 },
+  { id: "pseudocode", title: "Pseudocode", icon: FileCode2 },
   { id: "disassembly", title: "Assembly", icon: Terminal },
   { id: "strings", title: "Strings", icon: List },
   { id: "imports", title: "Imports", icon: ArrowDownToLine },
@@ -43,6 +49,8 @@ const tabs: { id: MainTab; title: string; icon: typeof Code2 }[] = [
 ];
 
 type Props = {
+  providers: Provider[];
+  onSettings: () => void;
   sample?: Sample;
   analysis: Analysis | null;
   func: FunctionDetail | null;
@@ -58,7 +66,8 @@ type Props = {
   onAnnotate: (kind: "rename" | "comment") => void;
   onApply: (annotation: Annotation) => void;
   applying: string;
-  onAsk: (question: string) => void;
+  onAsk: Ask;
+  onSelectFunction: (address: string) => void;
 };
 
 export default function WorkSurface(props: Props) {
@@ -103,7 +112,7 @@ export default function WorkSurface(props: Props) {
           </button>
         ))}
       </nav>
-      {sample.status === "queued" || sample.status === "analyzing" ? (
+      {tab === "workflow" ? <WorkflowPanel key={sample.id} sample={sample} providers={props.providers} onSettings={props.onSettings} /> : sample.status === "queued" || sample.status === "analyzing" ? (
         <div className="analysis-progress">
           <div className="progress-top">
             <div>
@@ -114,8 +123,8 @@ export default function WorkSurface(props: Props) {
                   : "Understanding your executable"}
               </h2>
               <p>
-                Ghidra is identifying functions, references, and program
-                structure. Larger binaries may take a few minutes.
+                Checking for UPX packing, then using Ghidra to identify functions,
+                references, and program structure. Larger binaries may take a few minutes.
               </p>
             </div>
             <div className="processing-glyph">
@@ -179,7 +188,12 @@ export default function WorkSurface(props: Props) {
               analysis={analysis}
               onNavigate={props.onNavigate}
               onAsk={props.onAsk}
+              onRetry={props.onRetry}
             />
+          )}
+          {tab === "pseudocode" && (
+            <PseudocodePanel key={sample.id} sample={sample} analysis={analysis} func={func}
+              loading={props.functionLoading} onSelect={props.onSelectFunction} onAsk={props.onAsk} />
           )}
           {(tab === "decompiler" || tab === "disassembly" || tab === "graph") &&
             (props.functionLoading ? (
@@ -365,11 +379,13 @@ function Overview({
   analysis,
   onNavigate,
   onAsk,
+  onRetry,
 }: {
   sample: Sample;
   analysis: Analysis;
   onNavigate: (address: string) => void;
   onAsk: (question: string) => void;
+  onRetry: () => void;
 }) {
   return (
     <div className="overview scroll-region">
@@ -387,6 +403,18 @@ function Overview({
         </div>
         <Status value={sample.status} />
       </div>
+      {analysis.preprocessing?.status === "unpacked" && (
+        <Notice tone="info">
+          UPX unpacked · {sizeLabel(analysis.preprocessing.original_size)} → {sizeLabel(analysis.preprocessing.analyzed_size)}.
+          {" "}Ghidra and investigation tools use the unpacked copy. Original upload preserved.
+        </Notice>
+      )}
+      {!analysis.preprocessing && analysis.sections?.some((section) => /^UPX[012]$/.test(section.name)) && (
+        <Notice tone="warning">
+          This analysis contains UPX packing. Reanalyze to unpack the file and recover the program inside.
+          <button className="button secondary small" onClick={onRetry}>Unpack and reanalyze</button>
+        </Notice>
+      )}
       <div className="metric-strip">
         <div>
           <span>Functions</span>
@@ -412,12 +440,27 @@ function Overview({
         </div>
         <dl className="identity-list">
           <div>
-            <dt>SHA-256</dt>
+            <dt>Upload SHA-256</dt>
             <dd className="hash-value">
               <code>{sample.sha256}</code>
               <CopyButton text={sample.sha256} />
             </dd>
           </div>
+          {analysis.preprocessing?.status === "unpacked" && (
+            <>
+              <div>
+                <dt>Analyzed SHA-256</dt>
+                <dd className="hash-value">
+                  <code>{analysis.preprocessing.analyzed_sha256}</code>
+                  <CopyButton text={analysis.preprocessing.analyzed_sha256} />
+                </dd>
+              </div>
+              <div>
+                <dt>Preprocessing</dt>
+                <dd>UPX {analysis.preprocessing.tool_version} · unpacked PE · {sizeLabel(analysis.preprocessing.analyzed_size)}</dd>
+              </div>
+            </>
+          )}
           <div>
             <dt>Image base</dt>
             <dd>

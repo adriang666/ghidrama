@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import os
+import shutil
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -24,7 +25,15 @@ class Settings:
     analysis_timeout: int = field(default_factory=lambda: int(os.getenv("GHIDRAMA_ANALYSIS_TIMEOUT", "600")))
     worker_memory_mb: int = field(default_factory=lambda: int(os.getenv("GHIDRAMA_WORKER_MEMORY_MB", "2048")))
     max_workers: int = field(default_factory=lambda: int(os.getenv("GHIDRAMA_MAX_WORKERS", "2")))
+    upx_path: Path | None = field(default_factory=lambda: _optional_path("GHIDRAMA_UPX_PATH"))
+    max_unpacked_mb: int = field(default_factory=lambda: int(os.getenv("GHIDRAMA_MAX_UNPACKED_MB", "256")))
+    unpack_timeout: int = field(default_factory=lambda: int(os.getenv("GHIDRAMA_UNPACK_TIMEOUT", "30")))
     allowed_hosts: list[str] = field(default_factory=lambda: os.getenv("GHIDRAMA_ALLOWED_HOSTS", "localhost,127.0.0.1,[::1],testserver").split(","))
+
+    @property
+    def upx_executable(self) -> Path | None:
+        path = self.upx_path or (Path(found) if (found := shutil.which("upx")) else None)
+        return path.resolve() if path and path.is_file() and os.access(path, os.X_OK) else None
 
     @property
     def ghidra_available(self) -> bool:

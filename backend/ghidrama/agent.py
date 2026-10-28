@@ -7,6 +7,7 @@ import os
 import re
 import sqlite3
 import sys
+import time
 import uuid
 from contextlib import contextmanager
 from datetime import datetime, timezone
@@ -15,6 +16,7 @@ from typing import Any, Literal, TypedDict
 
 import jsonschema
 from fastapi import APIRouter, HTTPException
+from fastapi.responses import Response
 from langgraph.graph import END, START, StateGraph
 from langsmith import tracing_context
 from mcp import ClientSession, StdioServerParameters
@@ -22,18 +24,28 @@ from mcp.client.stdio import stdio_client
 from pydantic import BaseModel, Field
 
 from .config import settings
+from .budgets import BUDGETS, DEFAULT_BUDGET, MAX_OUTPUT_TOKENS, PSEUDOCODE_OUTPUT_TOKENS, estimate_prompt_tokens, finishing_reason, request_size
 from .providers import ProviderClient, ProviderError, configured_client, router as provider_router
-from .store import Store
+from .store import Store, normalize_address
 
 
 router = APIRouter(tags=["investigations"])
 router.include_router(provider_router)
 _tasks: dict[str, asyncio.Task] = {}
-MAX_TURNS = 12
-MAX_TOOLS = 32
-MAX_SECONDS = 240
 MAX_CONTEXT_CHARS = 180000
-MAX_TOTAL_TOKENS = 80000
+
+
+class InvestigationLimit(ProviderError):
+    """Stop model work while retaining a clearly labelled evidence-only result."""
+
+
+def find_failure(error: BaseException, kind):
+    if isinstance(error, kind):
+        return error
+    for nested in getattr(error, "exceptions", []):
+        if result := find_failure(nested, kind):
+            return result
+    return None
 
 SYSTEM_PROMPT = """You are Ghidrama, a static reverse engineering assistant for a human analyst.
 Use the available Ghidra MCP tools to inspect the scoped executable. The user has asked for static analysis only.
@@ -43,6 +55,21 @@ Ground every factual conclusion in the retrieved evidence. Cite evidence as [E1]
 Separate observed facts, inferred purpose, and unknowns. Imported functions alone do not prove runtime behavior. Ghidra decompiled C is an approximation. Indirect calls and obfuscated code may be unresolved.
 Retrieve the specific function or instruction evidence needed before describing behavior. Use small, focused tool calls and pagination. Stop when the question is answered or evidence is insufficient.
 Answer concisely in Markdown with citations. Do not include hidden chain-of-thought; provide only conclusions, short explanations, and supporting evidence.
+"""
+
+PSEUDOCODE_PROMPT = """
+This run produces a readable pseudocode rewrite, grounded in the Ghidra decompilation.
+For a selected function, rewrite that function. Without a selected function, create a program-level sketch
+starting at the entry point and inspect relevant callees. A sketch is not a reconstruction of every function.
+Retrieve decompile_function evidence before rewriting a routine. Never invent code for unavailable routines.
+Preserve observed control flow, side effects, calls, integer widths, signedness, pointer semantics, and constants.
+Give inferred names descriptive meanings without pretending they are recovered original names. Keep addresses
+and a short mapping to Ghidra names. Mark unresolved calls and unknown types explicitly. Treat any truncated
+decompilation as incomplete; state the missing coverage instead of inventing the rest.
+Return Markdown with: Scope and coverage; Readable pseudocode in fenced code blocks; Interpretation and uncertainties.
+Cite the actual decompile_function evidence next to each rewritten routine, outside code fences.
+Label output as an AI interpretation, not original source, compilable code, or verified semantic equivalence.
+Do not merely describe the code in prose. Include a nonempty fenced pseudocode block and cite its source.
 """
 
 
@@ -108,6 +135,10 @@ class StartRun(BaseModel):
     provider: Literal["ollama", "openrouter"]
     model: str | None = Field(default=None, max_length=200)
     function_address: str | None = Field(default=None, max_length=64)
+    mode: Literal["investigation", "pseudocode"] = "investigation"
+    expected_revision: int | None = Field(default=None, ge=1)
+    budget: Literal["standard", "extended", "deep"] = DEFAULT_BUDGET
+    thinking: Literal["low", "medium", "high", "max"] | bool | None = None
 
 
 class AgentState(TypedDict):
@@ -116,6 +147,7 @@ class AgentState(TypedDict):
     pending: list[dict]
     answer: str
     repairs: int
+    finalizing: bool
 
 
 def child_environment() -> dict[str, str]:
@@ -152,17 +184,43 @@ def mcp_payload(result) -> dict:
 
 async def execute_run(run: dict, client: ProviderClient, function_address: str | None = None):
     persistence = RunStore()
+    run.setdefault("budget", DEFAULT_BUDGET)
+    run.setdefault("limits", dict(BUDGETS[run["budget"]]))
+    limits = run["limits"]
     run["status"] = "running"
     persistence.save(run)
+    deadline = time.monotonic() + limits["seconds"]
+    last_prompt_tokens = 0
+    last_request_size = 0
     tool_count = 0
     call_counts: dict[str, int] = {}
+    rewriting = run.get("mode") == "pseudocode"
+    output_limit = PSEUDOCODE_OUTPUT_TOKENS if rewriting else MAX_OUTPUT_TOKENS
+    run["max_output_tokens"] = output_limit
+    code_evidence: set[str] = set()
+    if rewriting:
+        run["pseudocode_coverage"] = {"scope": "function" if function_address else "program_sketch", "addresses": [], "truncated": False}
 
     def event(kind: str, message: str, **extra):
         run["events"].append({"type": kind, "message": message, "created_at": now(), **extra})
         persistence.save(run)
 
+    def retain_evidence(reason: str):
+        run["limit_reason"] = reason
+        if run["evidence"]:
+            run["status"] = "partial"
+            run["error"] = None
+            run["answer_kind"] = "evidence_index"
+            run["answer"] = "## Captured evidence only\n\nNo final model answer was produced before the investigation stopped. This is an index of retained evidence, not model findings.\n\n" + "\n".join(
+                f"- [{item['id']}] {item['summary']}" for item in run["evidence"])
+            event("partial", reason + " Captured evidence remains available.")
+        else:
+            run["status"] = "failed"
+            run["error"] = reason
+            event("error", reason)
+
     try:
-        async with asyncio.timeout(MAX_SECONDS):
+        async with asyncio.timeout(limits["seconds"]):
             parameters = StdioServerParameters(command=sys.executable, args=["-m", "ghidrama.mcp_server", "--sample-id", run["sample_id"], "--revision", str(run["analysis_revision"])], env=child_environment())
             # MCP diagnostics can include specimen-controlled content. Do not forward
             # it into application logs; explicit tool events remain in the audit trail.
@@ -183,8 +241,8 @@ async def execute_run(run: dict, client: ProviderClient, function_address: str |
                                 jsonschema.validate(arguments, schemas[name])
                             except jsonschema.ValidationError:
                                 return {"error": "Tool arguments do not match its schema. Correct the arguments."}
-                            if tool_count >= MAX_TOOLS:
-                                raise ProviderError("Investigation reached its tool-call budget. Narrow the question and start another run.")
+                            if tool_count >= limits["tool_calls"]:
+                                return {"error": "Investigation tool-call limit reached. Finish with the evidence already retrieved."}
                             fingerprint = json.dumps([name, arguments], sort_keys=True)
                             call_counts[fingerprint] = call_counts.get(fingerprint, 0) + 1
                             if call_counts[fingerprint] > 2:
@@ -206,49 +264,88 @@ async def execute_run(run: dict, client: ProviderClient, function_address: str |
                             evidence = {"id": identifier, "tool": name, "summary": summary, "sample_id": run["sample_id"], "revision": run["analysis_revision"], "address": payload.get("address") or arguments.get("address"), "arguments": arguments}
                             persistence.save_evidence(run["id"], identifier, {"evidence_id": identifier, **payload})
                             run["evidence"].append(evidence)
+                            if rewriting and name == "decompile_function" and (payload.get("decompiled") or "").strip():
+                                code_evidence.add(identifier)
+                                coverage = run["pseudocode_coverage"]
+                                if payload["address"] not in coverage["addresses"]:
+                                    coverage["addresses"].append(payload["address"])
+                                coverage["truncated"] = coverage["truncated"] or bool(payload.get("truncated"))
                             event("evidence", f"Captured [{identifier}] {summary}.", tool=name, evidence_id=identifier)
                             # The private checkpoint contains exact returned evidence.
                             return {"evidence_id": identifier, **payload}
 
-                        messages = [{"role": "system", "content": SYSTEM_PROMPT}, {"role": "user", "content": run["question"]}]
+                        messages = [{"role": "system", "content": SYSTEM_PROMPT + (PSEUDOCODE_PROMPT if rewriting else "")}, {"role": "user", "content": run["question"]}]
                         if function_address:
                             messages[1]["content"] += f"\nSelected function address: {function_address}"
                         bootstrap = await invoke("get_program_info", {})
                         if bootstrap.get("error"):
                             raise ProviderError("The sample's analysis is unavailable or changed. Refresh it and start a new investigation.")
+                        if rewriting:
+                            run["pseudocode_coverage"]["total_functions"] = bootstrap.get("function_count", 0)
                         messages.extend([
                             {"role": "assistant", "content": "", "tool_calls": [{"id": "initial_program", "type": "function", "function": {"name": "get_program_info", "arguments": "{}"}}]},
                             {"role": "tool", "tool_call_id": "initial_program", "tool_name": "get_program_info", "content": json.dumps(bootstrap)},
                         ])
-                        if function_address:
-                            selected = await invoke("decompile_function", {"address": function_address})
+                        seed_address = function_address
+                        if rewriting and not seed_address:
+                            functions = Store().list_functions(run["sample_id"])
+                            entry = bootstrap.get("program", {}).get("entry_point")
+                            seed_address = next((f["address"] for f in functions if f["address"] == entry), functions[0]["address"] if functions else None)
+                        if seed_address:
+                            selected = await invoke("decompile_function", {"address": seed_address})
+                            if rewriting and function_address and not (selected.get("decompiled") or "").strip():
+                                raise ProviderError("Ghidra could not decompile the selected function. Inspect its assembly before requesting a rewrite.")
                             messages.extend([
-                                {"role": "assistant", "content": "", "tool_calls": [{"id": "initial_function", "type": "function", "function": {"name": "decompile_function", "arguments": json.dumps({"address": function_address})}}]},
+                                {"role": "assistant", "content": "", "tool_calls": [{"id": "initial_function", "type": "function", "function": {"name": "decompile_function", "arguments": json.dumps({"address": seed_address})}}]},
                                 {"role": "tool", "tool_call_id": "initial_function", "tool_name": "decompile_function", "content": json.dumps(selected)},
                             ])
 
                         async def model_node(state: AgentState):
-                            if state["turns"] >= MAX_TURNS:
-                                raise ProviderError("Investigation reached its model-turn budget. Narrow the question and start another run.")
+                            nonlocal last_prompt_tokens, last_request_size
+                            if state["turns"] >= limits["model_turns"]:
+                                raise InvestigationLimit("Investigation reached its model-turn limit before a verified answer was available.")
                             if len(json.dumps(state["messages"])) > MAX_CONTEXT_CHARS:
-                                raise ProviderError("Evidence exceeded the context budget. Ask a more focused question.")
-                            if sum(run["usage"].values()) >= MAX_TOTAL_TOKENS:
-                                raise ProviderError("Investigation reached its token budget.")
-                            event("status", f"Analyzing retrieved evidence (step {state['turns'] + 1}/{MAX_TURNS}).")
-                            response = await client.chat(state["messages"], tool_definitions)
+                                raise InvestigationLimit("Evidence reached the context-size limit. Ask a narrower question; captured evidence is retained.")
+                            used = sum(run["usage"].values())
+                            estimated = estimate_prompt_tokens(state["messages"], tool_definitions, last_prompt_tokens, last_request_size)
+                            reason = run.get("limit_reason") or finishing_reason(limits, used=used, prompt_tokens=estimated,
+                                turns=state["turns"], tools=tool_count, seconds_left=deadline - time.monotonic(), output_tokens=output_limit)
+                            finalizing = state.get("finalizing", False) or bool(reason)
+                            messages = list(state["messages"])
+                            if finalizing and not state.get("finalizing"):
+                                run["limit_reason"] = reason
+                                event("warning", reason)
+                                messages.append({"role": "user", "content": "Finish this investigation now using only the evidence already retrieved. Do not request any more tools. Give the supported findings with [E#] citations, clearly state the limited coverage and unresolved questions, and do not claim the investigation is exhaustive. For pseudocode, include only routines supported by captured decompilation."})
+                            offered_tools = [] if finalizing else tool_definitions
+                            estimated = estimate_prompt_tokens(messages, offered_tools, last_prompt_tokens, last_request_size)
+                            available = limits["total_tokens"] - used - estimated
+                            if available < 256:
+                                raise InvestigationLimit(f"The remaining {limits['total_tokens']:,}-token budget cannot fit another model request. Choose a larger budget for a new investigation.")
+                            max_output = min(output_limit, available)
+                            event("status", ("Writing findings from the captured evidence" if finalizing else "Analyzing retrieved evidence") +
+                                  f" (step {state['turns'] + 1}/{limits['model_turns']}; {used:,}/{limits['total_tokens']:,} tokens used).")
+                            response = await client.chat(messages, offered_tools, max_output_tokens=max_output)
+                            last_prompt_tokens = response["usage"]["input_tokens"]
+                            last_request_size = request_size(messages, offered_tools)
                             for key in ("input_tokens", "output_tokens"):
                                 run["usage"][key] += response["usage"][key]
+                            if finalizing and response["tool_calls"]:
+                                raise InvestigationLimit("The model requested more tools while the investigation was finishing. Captured evidence has been retained.")
+                            if rewriting and response.get("truncated"):
+                                raise ProviderError("The model's pseudocode was cut off by its output limit. Rewrite a smaller function or request a shorter sketch.")
                             assistant = {key: response[key] for key in ("role", "content")}
                             # Provider continuation fields remain private checkpoint
                             # data and are never returned in the run API or UI events.
                             assistant.update(response.get("private_context", {}))
                             if response["tool_calls"]:
                                 assistant["tool_calls"] = response["tool_calls"]
-                            updated = {**state, "messages": [*state["messages"], assistant], "turns": state["turns"] + 1, "pending": response["tool_calls"], "answer": response["content"]}
+                            updated = {**state, "messages": [*messages, assistant], "turns": state["turns"] + 1, "pending": response["tool_calls"], "answer": response["content"], "finalizing": finalizing}
                             persistence.save(run, updated)
                             return updated
 
                         async def tool_node(state: AgentState):
+                            if sum(run["usage"].values()) >= limits["total_tokens"]:
+                                raise InvestigationLimit(f"Investigation reached its {limits['total_tokens']:,}-token budget before a final answer was available.")
                             messages = list(state["messages"])
                             for call in state["pending"]:
                                 name = call["function"]["name"]
@@ -267,11 +364,15 @@ async def execute_run(run: dict, client: ProviderClient, function_address: str |
                         async def verify_node(state: AgentState):
                             referenced = set(re.findall(r"\[(E\d+)\]", state["answer"]))
                             known = {evidence["id"] for evidence in run["evidence"]}
-                            if not referenced or not referenced.issubset(known):
+                            code_valid = not rewriting or (bool(referenced & code_evidence) and bool(re.search(r"```[^\n`]*\n\s*\S[\s\S]*?\n```", state["answer"])))
+                            if not referenced or not referenced.issubset(known) or not code_valid:
                                 if state["repairs"] >= 1:
-                                    raise ProviderError("The model did not produce valid evidence citations. Try a different model or a narrower question.")
+                                    raise ProviderError("The model did not produce valid evidence citations" + (" and a supported pseudocode block" if rewriting else "") + ". Try a different model or a narrower question.")
                                 event("warning", "The answer needs valid evidence citations; requesting one correction.")
-                                return {**state, "repairs": state["repairs"] + 1, "answer": "", "messages": [*state["messages"], {"role": "user", "content": "Revise the answer to cite only evidence actually retrieved in this run using [E1] syntax. Available evidence IDs: " + ", ".join(sorted(known)) + ". If the evidence is insufficient, state that clearly."}]}
+                                correction = "Revise the answer to cite only evidence actually retrieved in this run using [E1] syntax. Available evidence IDs: " + ", ".join(sorted(known)) + ". If the evidence is insufficient, state that clearly."
+                                if rewriting:
+                                    correction += " Include a nonempty fenced pseudocode block grounded in decompile_function evidence and cite it outside the block. Decompilation evidence IDs: " + ", ".join(sorted(code_evidence))
+                                return {**state, "repairs": state["repairs"] + 1, "answer": "", "messages": [*state["messages"], {"role": "user", "content": correction}]}
                             return state
 
                         graph = StateGraph(AgentState)
@@ -286,33 +387,32 @@ async def execute_run(run: dict, client: ProviderClient, function_address: str |
                         # Explicitly override host tracing settings: specimen evidence
                         # may go only to the analyst-selected model provider.
                         with tracing_context(enabled=False):
-                            final = await compiled.ainvoke({"messages": messages, "turns": 0, "pending": [], "answer": "", "repairs": 0}, config={"recursion_limit": MAX_TURNS * 3 + 6, "callbacks": []})
+                            final = await compiled.ainvoke({"messages": messages, "turns": 0, "pending": [], "answer": "", "repairs": 0, "finalizing": False}, config={"recursion_limit": limits["model_turns"] * 3 + 6, "callbacks": []})
                         run["answer"] = final["answer"]
-                        run["status"] = "complete"
-                        event("complete", "Investigation complete. Review the linked evidence alongside the findings.")
+                        run["answer_kind"] = "model"
+                        run["status"] = "partial" if final["finalizing"] else "complete"
+                        event(run["status"], "Partial findings saved from the evidence gathered within this investigation's limits." if final["finalizing"] else
+                              "Pseudocode rewrite complete. Compare the interpretation with its Ghidra evidence." if rewriting else "Investigation complete. Review the linked evidence alongside the findings.")
     except asyncio.CancelledError:
         run["status"] = "cancelled"
         run["error"] = None
         event("cancelled", "Investigation cancelled. Evidence gathered so far is retained.")
     except TimeoutError:
-        run["status"] = "failed"
-        run["error"] = "Investigation reached its four-minute time limit. Narrow the question and try again."
-        event("error", run["error"])
+        retain_evidence(f"Investigation reached its {limits['seconds'] // 60}-minute time limit.")
+    except InvestigationLimit as exc:
+        retain_evidence(str(exc))
     except ProviderError as exc:
         run["status"] = "failed"
         run["error"] = str(exc)
         event("error", run["error"])
     except Exception as failure:
-        run["status"] = "failed"
-        def provider_failure(error):
-            if isinstance(error, ProviderError):
-                return str(error)
-            for nested in getattr(error, "exceptions", []):
-                if message := provider_failure(nested):
-                    return message
-            return None
-        run["error"] = provider_failure(failure) or "Investigation could not finish. Check the analysis and provider settings, then start another run."
-        event("error", run["error"])
+        if limit := find_failure(failure, InvestigationLimit):
+            retain_evidence(str(limit))
+        else:
+            run["status"] = "failed"
+            provider_failure = find_failure(failure, ProviderError)
+            run["error"] = str(provider_failure) if provider_failure else "Investigation could not finish. Check the analysis and provider settings, then start another run."
+            event("error", run["error"])
     finally:
         run["finished_at"] = now()
         persistence.save(run)
@@ -348,6 +448,8 @@ async def start_run(sample_id: str, body: StartRun):
         raise HTTPException(404, "Sample not found")
     if sample["status"] not in ("ready", "partial"):
         raise HTTPException(409, "Wait for the sample analysis to finish first.")
+    if body.expected_revision is not None and body.expected_revision != sample["analysis_revision"]:
+        raise HTTPException(409, "Analysis revision changed. Refresh before starting a new run.")
     if len(_tasks) >= 2:
         raise HTTPException(429, "Two investigations are already running. Wait or cancel one.")
     try:
@@ -356,6 +458,16 @@ async def start_run(sample_id: str, body: StartRun):
         raise HTTPException(400, str(exc)) from None
     if not client.model:
         raise HTTPException(400, "Choose a model in provider settings first.")
+    if body.thinking is not None:
+        if body.provider != "ollama":
+            raise HTTPException(400, "A thinking override currently requires Ollama.")
+        try:
+            metadata = await client.request("POST", "/api/show", {"model": client.model})
+        except ProviderError as exc:
+            raise HTTPException(400, str(exc)) from None
+        if body.thinking not in metadata.get("thinking", {}).get("values", []):
+            raise HTTPException(400, "This model does not advertise support for the requested thinking setting.")
+        client.thinking = body.thinking
     question = body.question.strip()
     if not question:
         raise HTTPException(400, "Enter a question")
@@ -366,8 +478,13 @@ async def start_run(sample_id: str, body: StartRun):
             raise HTTPException(400, "Selected function address is invalid") from None
         if not function:
             raise HTTPException(404, "Selected function not found")
+        body.function_address = normalize_address(body.function_address)
     run = {"id": uuid.uuid4().hex, "sample_id": sample_id, "analysis_revision": sample["analysis_revision"], "question": question,
-           "provider": body.provider, "model": client.model, "status": "queued", "answer": "", "error": None,
+           "provider": body.provider, "model": client.model, "mode": body.mode, "function_address": body.function_address,
+           "budget": body.budget, "limits": dict(BUDGETS[body.budget]),
+           "thinking": body.thinking,
+           "preprocessing": (Store().get_analysis(sample_id) or {}).get("preprocessing"),
+           "status": "queued", "answer": "", "error": None,
            "events": [], "evidence": [], "usage": {"input_tokens": 0, "output_tokens": 0}, "created_at": now()}
     RunStore().save(run)
     task = asyncio.create_task(execute_run(run, client, body.function_address))
@@ -411,3 +528,32 @@ def get_evidence(run_id: str, evidence_id: str):
     if evidence is None:
         raise HTTPException(404, "Evidence not found")
     return evidence
+
+
+@router.get("/api/runs/{run_id}/download")
+def download_run(run_id: str):
+    persistence = RunStore()
+    run = persistence.get(run_id)
+    if not run:
+        raise HTTPException(404, "Investigation not found")
+    if run["status"] not in {"complete", "partial"}:
+        raise HTTPException(409, "Wait for the run to complete before downloading its answer.")
+    sample = Store().get_sample(run["sample_id"])
+    lines = ["# Ghidrama " + ("AI pseudocode interpretation" if run.get("mode") == "pseudocode" else "investigation"), "",
+             f"Sample SHA-256: {sample['sha256'] if sample else 'unavailable'}",
+             f"Analysis revision: {run.get('analysis_revision', 'unknown')}", f"Status: {run['status']}",
+             f"Limit notice: {run.get('limit_reason') or 'None'}", f"Cumulative usage: {sum(run.get('usage', {}).values()):,} tokens",
+             f"Provider / model: {run['provider']} / {run['model']}", "", run["answer"], "", "## Captured evidence", ""]
+    preprocessing = run.get("preprocessing") or {}
+    if preprocessing.get("status") == "unpacked":
+        lines[3:3] = [f"Analyzed unpacked SHA-256: `{preprocessing['analyzed_sha256']}`",
+                      f"Preprocessing: UPX {preprocessing.get('tool_version', 'unknown')}; original upload preserved."]
+    for evidence in run["evidence"]:
+        lines += [f"### [{evidence['id']}] {evidence['summary']}", ""]
+        payload = persistence.get_evidence(run_id, evidence["id"])
+        # A long fence safely encloses specimen-controlled Markdown/backticks.
+        text = json.dumps(payload, ensure_ascii=False, indent=2)
+        fence = "`" * max(3, 1 + max((len(m.group()) for m in re.finditer(r"`+", text)), default=0))
+        lines += [fence + "json", text, fence, ""]
+    return Response("\n".join(lines), media_type="text/markdown; charset=utf-8",
+                    headers={"Content-Disposition": f'attachment; filename="ghidrama-{run_id[:8]}.md"'})

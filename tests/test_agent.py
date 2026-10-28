@@ -158,6 +158,59 @@ async def test_actual_mcp_transport_scope_pagination_and_revision(sample):
 
 
 @pytest.mark.asyncio
+async def test_supported_ollama_thinking_override_is_scoped_to_run(sample, monkeypatch):
+    from fastapi import HTTPException
+    requests = []
+    def respond(request):
+        payload = json.loads(request.content)
+        requests.append((request.url.path, payload))
+        if request.url.path == "/api/show":
+            return httpx.Response(200, json={"thinking": {"values": ["low", "max"], "default": "max"}})
+        assert payload["think"] == "low"
+        return httpx.Response(200, json={"message": {"content": "Answer [E1]"}, "done_reason": "stop"})
+    client = ProviderClient("ollama", "test-secret", "test-model", httpx.MockTransport(respond))
+    monkeypatch.setattr(agent, "configured_client", lambda *args: client)
+    async def execute(run, configured, address):
+        assert configured.thinking == "low"
+        await configured.chat([{"role": "user", "content": "Explain"}], [])
+        run["status"] = "complete"
+        agent.RunStore().save(run)
+    monkeypatch.setattr(agent, "execute_run", execute)
+    run = await agent.start_run(sample["id"], agent.StartRun(question="Explain", provider="ollama", thinking="low"))
+    await agent._tasks[run["id"]]
+    assert run["thinking"] == "low"
+    assert [path for path, _ in requests] == ["/api/show", "/api/chat"]
+    with pytest.raises(HTTPException, match="advertise support"):
+        await agent.start_run(sample["id"], agent.StartRun(question="Explain", provider="ollama", thinking="medium"))
+
+
+@pytest.mark.asyncio
+async def test_decompilation_pages_reconstruct_large_functions(sample):
+    from ghidrama.mcp_server import build_server
+    store = Store()
+    function = store.get_function(sample["id"], "0x140001000")
+    original = "/* recovered code */\n" + "return value;\n" * 5000
+    function.update(decompiled=original, decompiled_truncated=False, detail_loaded=True)
+    store.save_function(sample["id"], 1, function)
+    server = build_server(sample["id"], 1)
+    pieces = []
+    offset = 0
+    while offset is not None:
+        content = await server.call_tool("decompile_function", {"address": "0x140001000", "offset": offset})
+        payload = json.loads(content[0].text)
+        assert payload["offset"] == offset
+        assert len(payload["decompiled"]) <= 24000
+        assert payload["total_characters"] == len(original)
+        assert not payload["source_truncated"]
+        pieces.append(payload["decompiled"])
+        offset = payload["next_offset"]
+    assert "".join(pieces) == original
+    for arguments in [{"offset": -1}, {"offset": len(original) + 1}, {"limit": 24001}, {"limit": 0}]:
+        with pytest.raises(Exception):
+            await server.call_tool("decompile_function", {"address": "0x140001000", **arguments})
+
+
+@pytest.mark.asyncio
 async def test_cancelled_mcp_detail_signals_synchronous_worker(sample, monkeypatch):
     from ghidrama import analysis
     from ghidrama.mcp_server import build_server
@@ -182,7 +235,7 @@ async def test_cancelled_mcp_detail_signals_synchronous_worker(sample, monkeypat
 async def test_agent_uses_real_mcp_and_persists_evidence(sample):
     class Model:
         count = 0
-        async def chat(self, messages, tools):
+        async def chat(self, messages, tools, *, max_output_tokens=4096):
             self.count += 1
             if self.count == 1:
                 return {"role": "assistant", "content": "", "tool_calls": [{"id": "find", "type": "function", "function": {"name": "decompile_function", "arguments": '{"address":"0x140001000"}'}}], "usage": {"input_tokens": 10, "output_tokens": 5}}
@@ -205,7 +258,7 @@ async def test_agent_uses_real_mcp_and_persists_evidence(sample):
 async def test_invalid_citations_fail_after_one_repair(sample):
     class Model:
         count = 0
-        async def chat(self, messages, tools):
+        async def chat(self, messages, tools, *, max_output_tokens=4096):
             self.count += 1
             return {"role": "assistant", "content": "Unsupported claim [E999]", "tool_calls": [], "usage": {"input_tokens": 1, "output_tokens": 1}}
     model = Model()
@@ -221,7 +274,7 @@ async def test_invalid_citations_fail_after_one_repair(sample):
 async def test_agent_cancellation_retains_evidence(sample):
     entered = asyncio.Event()
     class Model:
-        async def chat(self, messages, tools):
+        async def chat(self, messages, tools, *, max_output_tokens=4096):
             entered.set()
             await asyncio.sleep(30)
     run = new_run(sample)

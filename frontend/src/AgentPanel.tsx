@@ -1,6 +1,7 @@
 import { useEffect, useRef, useState } from "react";
 import {
   ArrowRight,
+  ArrowDownToLine,
   Check,
   ChevronDown,
   Code2,
@@ -18,14 +19,14 @@ import {
 } from "lucide-react";
 import ReactMarkdown from "react-markdown";
 import { errorMessage, formatTime, providerName, request } from "./api";
-import type { Evidence, FunctionDetail, Provider, Run, Sample } from "./types";
+import type { Evidence, FunctionDetail, Provider, RequestedPrompt, Run, Sample } from "./types";
 import { Modal, Notice, Spinner } from "./ui";
 
 type Props = {
   sample?: Sample;
   func: FunctionDetail | null;
   providers: Provider[];
-  requestedPrompt: { text: string; nonce: number } | null;
+  requestedPrompt: RequestedPrompt | null;
   onSettings: () => void;
   onNavigate: (address: string) => void;
   onClose: () => void;
@@ -43,6 +44,8 @@ export default function AgentPanel({
   const [provider, setProvider] = useState("ollama");
   const [model, setModel] = useState("");
   const [question, setQuestion] = useState("");
+  const [mode, setMode] = useState<"investigation" | "pseudocode">("investigation");
+  const [budget, setBudget] = useState<"standard" | "extended" | "deep">("extended");
   const [runs, setRuns] = useState<Run[]>([]);
   const [runId, setRunId] = useState<string | null>(null);
   const [error, setError] = useState("");
@@ -67,20 +70,12 @@ export default function AgentPanel({
     setModel(selectedProvider?.model || "");
   }, [provider, selectedProvider?.model]);
   useEffect(() => {
-    if (requestedPrompt) {
-      setQuestion(requestedPrompt.text);
-      textarea.current?.focus();
-    }
-  }, [requestedPrompt]);
-  useEffect(() => {
-    setIncludeFunction(true);
-  }, [func?.address]);
-
-  useEffect(() => {
     setRuns([]);
     setRunId(null);
     setError("");
     setQuestion("");
+    setMode("investigation");
+    setIncludeFunction(true);
     if (!sample?.id) return;
     let cancelled = false;
     const load = async () => {
@@ -102,6 +97,17 @@ export default function AgentPanel({
     };
   }, [sample?.id]);
 
+  useEffect(() => {
+    if (requestedPrompt && requestedPrompt.sampleId === sample?.id) {
+      setQuestion(requestedPrompt.text);
+      setMode(requestedPrompt.mode);
+      setIncludeFunction(requestedPrompt.scope === "function");
+      setRunId(null);
+      setError("");
+      textarea.current?.focus();
+    }
+  }, [requestedPrompt, sample?.id]);
+
   const start = async () => {
     if (!sample || !question.trim() || !ready || busy || running) return;
     setBusy(true);
@@ -113,6 +119,9 @@ export default function AgentPanel({
           question: question.trim(),
           provider,
           model: model.trim(),
+          mode,
+          budget,
+          expected_revision: sample.analysis_revision,
           ...(func && includeFunction
             ? { function_address: func.address }
             : {}),
@@ -171,6 +180,7 @@ export default function AgentPanel({
             onClick={() => {
               setRunId(null);
               setQuestion("");
+              setMode("investigation");
               setError("");
               textarea.current?.focus();
             }}
@@ -226,7 +236,7 @@ export default function AgentPanel({
             <option value="">New investigation</option>
             {runs.map((run) => (
               <option key={run.id} value={run.id}>
-                {formatTime(run.created_at)} · {run.question.slice(0, 65)}
+                {formatTime(run.created_at)} · {run.mode === "pseudocode" ? "Pseudocode · " : ""}{run.question.slice(0, 65)}
               </option>
             ))}
           </select>
@@ -296,7 +306,7 @@ export default function AgentPanel({
                 <div className="mini-agent">
                   <WandSparkles size={13} />
                 </div>
-                <strong>Investigator</strong>
+                <strong>{selectedRun.answer_kind === "evidence_index" ? "Captured evidence" : selectedRun.mode === "pseudocode" ? "Pseudocode rewrite" : "Investigator"}</strong>
                 <span>
                   {running ? (
                     <>
@@ -313,6 +323,21 @@ export default function AgentPanel({
                   )}
                 </span>
               </div>
+              {selectedRun.usage && <div className="run-budget-meter">
+                <span>{(selectedRun.usage.input_tokens + selectedRun.usage.output_tokens).toLocaleString()} / {(selectedRun.limits?.total_tokens || 80000).toLocaleString()} cumulative tokens</span>
+                <progress aria-label="Investigation token usage" max={selectedRun.limits?.total_tokens || 80000}
+                  value={Math.min(selectedRun.usage.input_tokens + selectedRun.usage.output_tokens, selectedRun.limits?.total_tokens || 80000)} />
+              </div>}
+              {selectedRun.limit_reason && <Notice tone="warning">{selectedRun.limit_reason}</Notice>}
+              {selectedRun.mode === "pseudocode" && selectedRun.answer_kind !== "evidence_index" && <div className="rewrite-note">
+                <strong>AI interpretation · revision {selectedRun.analysis_revision}</strong>
+                {selectedRun.pseudocode_coverage && <p>
+                  {selectedRun.pseudocode_coverage.scope === "program_sketch" ? "Program sketch" : "Function rewrite"} · Ghidra code retrieved for {selectedRun.pseudocode_coverage.addresses.length} of {selectedRun.pseudocode_coverage.total_functions} indexed functions.
+                  {selectedRun.pseudocode_coverage.truncated ? " Some source evidence was truncated." : ""}
+                </p>}
+                <p>Compare the rewrite with its captured Ghidra evidence; inferred names and types may be incorrect.</p>
+              </div>}
+              {selectedRun.analysis_revision && selectedRun.analysis_revision !== sample?.analysis_revision && <Notice tone="warning">This run uses an earlier analysis revision. Its captured evidence is preserved.</Notice>}
               {!!selectedRun.events?.length && (
                 <div className="activity">
                   <button
@@ -402,6 +427,16 @@ export default function AgentPanel({
                 </div>
               )}
               {selectedRun.error && <Notice>{selectedRun.error}</Notice>}
+              {(selectedRun.status === "complete" || selectedRun.status === "partial") && <a className="button secondary small run-download" href={`/api/runs/${selectedRun.id}/download`} download>
+                <ArrowDownToLine size={14} />Download answer and evidence
+              </a>}
+              {(selectedRun.status === "failed" || selectedRun.status === "partial") && <button className="text-button run-download" onClick={() => {
+                setQuestion(selectedRun.question);
+                setMode(selectedRun.mode || "investigation");
+                setRunId(null);
+                setError("");
+                textarea.current?.focus();
+              }}>Use question again</button>}
               {running && !selectedRun.answer && (
                 <div className="agent-thinking">
                   <span />
@@ -459,6 +494,21 @@ export default function AgentPanel({
           </button>
         )}
         <div className="composer">
+          <label className="task-mode">
+            <span>Run budget</span>
+            <select aria-label="Investigation budget" value={budget} disabled={running || busy} onChange={event => setBudget(event.target.value as typeof budget)}>
+              <option value="standard">Standard · 80k tokens</option>
+              <option value="extended">Extended · 250k tokens</option>
+              <option value="deep">Deep · 500k tokens</option>
+            </select>
+          </label>
+          <label className="task-mode">
+            <span>Task</span>
+            <select aria-label="Investigation task" value={mode} onChange={event => setMode(event.target.value as typeof mode)}>
+              <option value="investigation">Analyze evidence</option>
+              <option value="pseudocode">Rewrite pseudocode</option>
+            </select>
+          </label>
           {func && (
             <label className="function-context">
               <input
@@ -532,6 +582,7 @@ export default function AgentPanel({
         </div>
         <p className="composer-note">
           Analysis excerpts are sent to {providerName(provider)}.
+          <br />Budgets count input + output across all calls. Larger budgets may use more provider credits.
         </p>
       </div>
       {openEvidence && (

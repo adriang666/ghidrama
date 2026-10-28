@@ -37,6 +37,12 @@ else:
     failures.append("JAVA_HOME must point to JDK 21 or a release-compatible JDK")
 if not (ROOT / "frontend" / "dist" / "index.html").is_file():
     failures.append("Frontend is not built; run pnpm build in frontend")
+from ghidrama.config import settings
+upx = settings.upx_executable
+if upx:
+    print(f"UPX: {upx} (unpacking enabled)")
+else:
+    print("UPX: unavailable; ordinary PE analysis works, UPX-packed uploads need GHIDRAMA_UPX_PATH")
 for failure in failures:
     print(f"NEEDS ATTENTION: {failure}")
 if not failures:

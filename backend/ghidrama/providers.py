@@ -116,13 +116,14 @@ class ProviderClient:
             raise ProviderError("Unknown model provider")
         self.provider, self.api_key, self.model = provider, api_key, model
         self.transport = transport
+        self.thinking: str | bool | None = None
 
-    async def request(self, method: str, path: str, body: dict | None = None) -> dict:
+    async def request(self, method: str, path: str, body: dict | None = None, *, timeout: int = 90) -> dict:
         headers = {"Authorization": f"Bearer {self.api_key}", "Content-Type": "application/json"}
         if self.provider == "openrouter":
             headers["X-Title"] = "Ghidrama"
         try:
-            async with httpx.AsyncClient(timeout=httpx.Timeout(90, connect=15), transport=self.transport, follow_redirects=False) as client:
+            async with httpx.AsyncClient(timeout=httpx.Timeout(timeout, connect=15), transport=self.transport, follow_redirects=False) as client:
                 response = await client.request(method, PROVIDERS[self.provider]["base_url"] + path, headers=headers, json=body)
             if response.status_code in (401, 403):
                 raise ProviderError("The provider rejected the API key or access to this model.")
@@ -160,18 +161,23 @@ class ProviderClient:
         await self.request("POST", "/api/chat", {"model": self.model, "messages": [{"role": "user", "content": "Reply OK."}], "stream": False, "options": {"num_predict": 4}})
         return "Connected. The selected Ollama model answered a short test request."
 
-    async def chat(self, messages: list[dict], tools: list[dict]) -> dict:
+    async def chat(self, messages: list[dict], tools: list[dict], *, max_output_tokens: int = 4096) -> dict:
         if not self.model:
             raise ProviderError("Choose a model in provider settings first.")
+        if not 1 <= max_output_tokens <= 16384:
+            raise ProviderError("Invalid model output-token allowance.")
         if self.provider == "openrouter":
             wire_messages = [{key: value for key, value in message.items() if key not in ("tool_name", "thinking")} for message in messages]
-            payload = {"model": self.model, "messages": wire_messages, "tools": tools, "stream": False, "max_tokens": 4096,
+            payload = {"model": self.model, "messages": wire_messages, "stream": False, "max_tokens": max_output_tokens,
                        "provider": {"require_parameters": True, "data_collection": "deny"}}
-            response = await self.request("POST", "/chat/completions", payload)
+            if tools:
+                payload["tools"] = tools
+            response = await self.request("POST", "/chat/completions", payload, timeout=180 if max_output_tokens > 4096 else 90)
             choices = response.get("choices", [])
             if not choices or not isinstance(choices[0].get("message"), dict):
                 raise ProviderError("The model did not return a usable answer.")
             message = choices[0]["message"]
+            truncated = choices[0].get("finish_reason") == "length"
             usage = response.get("usage", {})
             calls = message.get("tool_calls") or []
         else:
@@ -193,8 +199,14 @@ class ProviderClient:
                 if message.get("tool_name"):
                     item["tool_name"] = message["tool_name"]
                 native_messages.append(item)
-            response = await self.request("POST", "/api/chat", {"model": self.model, "messages": native_messages, "tools": tools, "stream": False, "options": {"num_predict": 4096}})
+            payload = {"model": self.model, "messages": native_messages, "stream": False, "options": {"num_predict": max_output_tokens}}
+            if self.thinking is not None:
+                payload["think"] = self.thinking
+            if tools:
+                payload["tools"] = tools
+            response = await self.request("POST", "/api/chat", payload, timeout=180 if max_output_tokens > 4096 else 90)
             message = response.get("message")
+            truncated = response.get("done_reason") == "length"
             if not isinstance(message, dict):
                 raise ProviderError("The model did not return a usable answer.")
             usage = {"prompt_tokens": response.get("prompt_eval_count", 0), "completion_tokens": response.get("eval_count", 0)}
@@ -218,7 +230,8 @@ class ProviderClient:
         if self.provider == "openrouter" and isinstance(message.get("reasoning_details"), list):
             private_context["reasoning_details"] = message["reasoning_details"]
         return {"role": "assistant", "content": str(message.get("content") or "")[:40000], "tool_calls": normalized,
-                "usage": counts, "private_context": private_context}
+                "usage": counts, "private_context": private_context,
+                "truncated": truncated or len(str(message.get("content") or "")) > 40000}
 
 
 def configured_client(provider: str, model: str | None = None) -> ProviderClient:

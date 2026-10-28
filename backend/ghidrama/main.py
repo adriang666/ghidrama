@@ -41,12 +41,16 @@ async def lifespan(app: FastAPI):
         try:
             store.recover_jobs()
             manager = AnalysisManager()
-            from . import agent
+            from . import agent, pseudocode, workflow
             await agent.startup()
+            await pseudocode.startup()
+            await workflow.startup()
             try:
                 yield
             finally:
+                await workflow.shutdown()
                 await agent.shutdown()
+                await pseudocode.shutdown()
                 await manager.shutdown()
         finally:
             fcntl.flock(server_lock, fcntl.LOCK_UN)
@@ -103,9 +107,10 @@ def require_sample(sample_id: str) -> dict:
 
 @app.get("/api/health")
 def health():
+    from . import pseudocode, workflow
     java = bool((settings.java_home and (settings.java_home / "bin/java").is_file()) or shutil.which("java"))
     pyghidra = importlib.util.find_spec("pyghidra") is not None
-    return {"status": "ok", "ghidra_available": settings.ghidra_available and java and pyghidra, "ghidra_version": settings.ghidra_version, "java_available": java, "pyghidra_available": pyghidra, "active_jobs": manager.active_jobs if manager else 0, "max_upload_mb": settings.max_upload_mb}
+    return {"status": "ok", "ghidra_available": settings.ghidra_available and java and pyghidra, "ghidra_version": settings.ghidra_version, "upx_available": settings.upx_executable is not None, "max_unpacked_mb": settings.max_unpacked_mb, "java_available": java, "pyghidra_available": pyghidra, "active_jobs": (manager.active_jobs if manager else 0) + pseudocode.active_jobs() + len(workflow._tasks), "max_upload_mb": settings.max_upload_mb}
 
 
 @app.get("/api/samples")
@@ -157,6 +162,8 @@ def sample_details(sample_id: str):
 @app.post("/api/samples/{sample_id}/analyze", status_code=202)
 async def analyze_sample(sample_id: str):
     require_sample(sample_id)
+    from .workflow import require_idle
+    require_idle(sample_id)
     if not manager:
         raise HTTPException(503, "Analysis scheduler is unavailable.")
     manager.submit(sample_id)
@@ -214,6 +221,8 @@ def propose_annotation(sample_id: str, proposal: AnnotationProposal):
 @app.post("/api/samples/{sample_id}/annotations/{annotation_id}/apply")
 async def commit_annotation(sample_id: str, annotation_id: str):
     require_sample(sample_id)
+    from .workflow import require_idle
+    require_idle(sample_id)
     if not Store().get_annotation(sample_id, annotation_id):
         raise HTTPException(404, "Annotation not found.")
     return await asyncio.to_thread(apply_annotation, sample_id, annotation_id)
@@ -227,6 +236,11 @@ def report(sample_id: str):
     if not analysis:
         raise HTTPException(409, "Analyze this sample before exporting a report.")
     lines = [f"# Ghidrama analysis: {sample['name']}", "", f"SHA-256: `{sample['sha256']}`", f"Architecture: {sample['architecture']}", f"Analysis revision: {sample['analysis_revision']}", f"Status: {sample['status']}", f"Engine: Ghidra {analysis.get('engine', {}).get('version', 'unknown')}", "", "## Analysis warnings", ""]
+    preprocessing = analysis.get("preprocessing", {})
+    if preprocessing.get("status") == "unpacked":
+        lines[-2:-2] = ["## UPX unpacking", "", f"Analyzed the unpacked PE using UPX {preprocessing.get('tool_version', 'unknown')}. Original upload preserved.",
+                       f"Analyzed SHA-256: `{preprocessing['analyzed_sha256']}`",
+                       f"Size: {preprocessing['original_size']} → {preprocessing['analyzed_size']} bytes", ""]
     lines.extend(f"- {w}" for w in analysis.get("warnings", []))
     if not analysis.get("warnings"):
         lines.append("No analysis warnings recorded.")
@@ -240,8 +254,10 @@ def report(sample_id: str):
     runs = list_sample_runs(sample_id)
     lines += ["", "## Investigations", ""]
     for run in runs:
-        if run.get("status") == "complete":
-            lines += [f"### {run['question']}", "", f"Provider: {run['provider']} / {run['model']}", f"Analysis revision: {run.get('analysis_revision', 'unavailable')}", "", run.get("answer") or "", "", "Evidence:", ""]
+        if run.get("status") in {"complete", "partial"}:
+            lines += [f"### {run['question']}", "", f"Provider: {run['provider']} / {run['model']}", f"Status: {run['status']}",
+                      f"Analysis revision: {run.get('analysis_revision', 'unavailable')}", f"Limit notice: {run.get('limit_reason') or 'None'}",
+                      "", run.get("answer") or "", "", "Evidence:", ""]
             for evidence in run.get("evidence", []):
                 lines.append(f"- [{evidence['id']}] {evidence.get('tool', '')} at `{evidence.get('address') or 'program'}`; analysis revision {evidence.get('revision', run.get('analysis_revision', 'unavailable'))}: {evidence.get('summary', '')}")
             lines.append("")
@@ -249,7 +265,11 @@ def report(sample_id: str):
 
 
 from .agent import router as agent_router
+from .pseudocode import router as pseudocode_router
+from .workflow import router as workflow_router
 app.include_router(agent_router)
+app.include_router(pseudocode_router)
+app.include_router(workflow_router)
 
 frontend = Path(os.getenv("GHIDRAMA_FRONTEND_DIR", str(Path(__file__).resolve().parents[2] / "frontend/dist"))).resolve()
 if (frontend / "assets").is_dir():

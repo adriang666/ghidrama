@@ -63,7 +63,9 @@ def function_detail(program, function, monitor) -> dict:
         interface.openProgram(program)
         decompiled = interface.decompileFunction(function, 30, monitor)
         if decompiled.decompileCompleted():
-            result["decompiled"] = str(decompiled.getDecompiledFunction().getC())[:1_000_000]
+            code = str(decompiled.getDecompiledFunction().getC())
+            result["decompiled"] = code[:1_000_000]
+            result["decompiled_truncated"] = len(code) > 1_000_000
         else:
             result["decompile_error"] = str(decompiled.getErrorMessage()) or "The decompiler could not recover this function."
     finally:
@@ -123,14 +125,19 @@ def execute(args) -> dict:
     resource.setrlimit(resource.RLIMIT_CPU, (args.timeout + 60, args.timeout + 65))
     pyghidra.start(install_dir=Path(os.environ["GHIDRA_INSTALL_DIR"]))
     folder = Path(args.sample_dir)
-    projects = folder / "project"
+    import re
+    from .unpacking import project_directory
+    if args.input_name != "original.bin" and not re.fullmatch(r"unpacked-[0-9a-f]{64}\.bin", args.input_name):
+        raise ValueError("Invalid analysis input filename.")
+    source = folder / args.input_name
+    projects = project_directory(folder, source)
     projects.mkdir(exist_ok=True)
     monitor = pyghidra.task_monitor(args.timeout)
     with pyghidra.open_project(projects, "main", create=True) as project:
         if project.getProjectData().getFile("/program") is None:
             if args.action != "analyze":
                 raise ValueError("The Ghidra project has not been imported yet.")
-            loader = pyghidra.program_loader().project(project).source(str(folder / "original.bin")).name("program")
+            loader = pyghidra.program_loader().project(project).source(str(source)).name("program")
             with loader.load() as results:
                 results.save(monitor)
         with pyghidra.program_context(project, "/program") as program:
@@ -140,6 +147,19 @@ def execute(args) -> dict:
                     warnings.append("Analysis reached its time limit; available results are partial.")
                 monitor = pyghidra.task_monitor(60)
                 program.save("Ghidrama analysis", monitor)
+            if args.action == "functions":
+                functions = []
+                for target_address in args.addresses or []:
+                    target = program.getAddressFactory().getDefaultAddressSpace().getAddress(target_address)
+                    function = program.getFunctionManager().getFunctionAt(target)
+                    if function is None:
+                        raise ValueError("Function not found at the supplied address.")
+                    try:
+                        functions.append(function_detail(program, function, pyghidra.task_monitor(35)))
+                    except Exception:
+                        functions.append({**function_summary(function),
+                                          "decompile_error": "Ghidra could not recover this function. Inspect its assembly."})
+                return {"functions": functions}
             if args.action == "function":
                 target = program.getAddressFactory().getDefaultAddressSpace().getAddress(args.address)
                 function = program.getFunctionManager().getFunctionAt(target)
@@ -161,7 +181,7 @@ def execute(args) -> dict:
                     else:
                         raise ValueError("Unsupported annotation kind.")
                 program.save("Ghidrama annotation " + proposal["id"], monitor)
-            return export_program(program, monitor, folder / "original.bin", warnings)
+            return export_program(program, monitor, source, warnings)
 
 
 def main():
@@ -176,10 +196,12 @@ def main():
             return
     parser = argparse.ArgumentParser()
     parser.add_argument("--sample-dir", required=True)
-    parser.add_argument("--action", choices=["analyze", "function", "annotate"], required=True)
+    parser.add_argument("--input-name", default="original.bin")
+    parser.add_argument("--action", choices=["analyze", "function", "functions", "annotate"], required=True)
     parser.add_argument("--output", required=True)
     parser.add_argument("--timeout", type=int, default=600)
     parser.add_argument("--address")
+    parser.add_argument("--addresses", nargs="+", default=[])
     parser.add_argument("--proposal")
     args = parser.parse_args()
     try:
